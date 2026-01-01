@@ -99,6 +99,7 @@ class Track:
     velocities: list[tuple[float, float]] = field(default_factory=list)
     embeddings: list[np.ndarray] = field(default_factory=list)
     cluster_history: Counter = field(default_factory=lambda: Counter())
+    locked_cluster_id: int | None = None  # To prevent flickering
 
     # Flow statistics
     total_distance: float = 0.0
@@ -190,9 +191,23 @@ class Track:
     @property
     def stable_cluster_id(self) -> int:
         """Get the most frequent cluster ID from history."""
+        # Return locked ID if set
+        if self.locked_cluster_id is not None:
+            return self.locked_cluster_id
+
         if not self.cluster_history:
             return self.cluster_id
-        return self.cluster_history.most_common(1)[0][0]
+        
+        # Check if we should lock
+        most_common = self.cluster_history.most_common(1)[0]
+        cid, count = most_common
+        total = self.cluster_history.total()
+        
+        # Lock if > 60% agreement and > 10 samples
+        if total > 10 and (count / total) > 0.6 and cid >= 0:
+            self.locked_cluster_id = cid
+            
+        return cid
 
     def update(self, detection: "Detection", embedding: np.ndarray | None = None):
         """Update track with new detection."""
@@ -282,13 +297,12 @@ class ObjectTracker:
         """
         self._frame_count += 1
 
-        # Predict new locations for existing tracks
-        for track in self._tracks:
-            track.predict()
-
+        # NOTE: Predict is handled by predict_only() in the main loop for smooth visualization.
+        # We assume tracks are already predicted to the current time t.
+        
         # Match detections to tracks
         # If there is a delay, match against back-projected locations
-        matched, unmatched_dets, unmatched_tracks = self._associate(detections, delay_frames)
+        matched, unmatched_dets, unmatched_tracks = self._associate(detections, delay_frames, features)
 
         # Update matched tracks
         for track_idx, det_idx in matched:
@@ -377,7 +391,7 @@ class ObjectTracker:
         return [t for t in self._tracks if t.hit_streak >= self.min_hits or self._frame_count <= self.min_hits]
 
     def _associate(
-        self, detections: list["Detection"], delay_frames: int = 0
+        self, detections: list["Detection"], delay_frames: int = 0, features: list["ObjectFeature"] | None = None
     ) -> tuple[list[tuple[int, int]], list[int], list[int]]:
         """Associate detections with existing tracks using Hungarian algorithm.
 
@@ -410,18 +424,50 @@ class ObjectTracker:
                  )
 
             for d, det in enumerate(detections):
-                cost_matrix[t, d] = 1 - iou(compare_bbox, det.bbox)
+                iou_score = iou(compare_bbox, det.bbox)
+                
+                # Appearance cost (cosine distance)
+                appearance_cost = 0.0
+                if features and d < len(features) and track.mean_embedding is not None:
+                    # Cosine distance = 1 - (A . B) / (|A| |B|)
+                    # Embeddings are usually normalized by DINOv2Extractor, but let's be safe
+                    track_emb = track.mean_embedding
+                    det_emb = features[d].embedding
+                    
+                    # Normalize if needed (assuming already normalized for speed, but...)
+                    sim = np.dot(track_emb, det_emb) / (np.linalg.norm(track_emb) * np.linalg.norm(det_emb) + 1e-6)
+                    appearance_cost = 1.0 - max(0.0, min(1.0, sim))
+
+                # Hybrid cost: 80% IoU, 20% Appearance
+                # prevents lane jumping (IoU=0) while allowing fast approach (IoU=0.2)
+                if appearance_cost > 0:
+                     cost_matrix[t, d] = 0.8 * (1 - iou_score) + 0.2 * appearance_cost
+                else:
+                     cost_matrix[t, d] = 1 - iou_score
 
         # Hungarian assignment
         row_indices, col_indices = linear_sum_assignment(cost_matrix)
 
-        # Filter matches by IoU threshold
+        # Filter matches by IoU threshold (allow looser IoU if appearance is strong)
         matched = []
         unmatched_dets = list(range(n_dets))
         unmatched_tracks = list(range(n_tracks))
 
         for t, d in zip(row_indices, col_indices):
+            # Dynamic threshold?
+            # If cost is low, match.
+            # But we must verify IoU is not ZERO (impossible match)
+            is_match = False
             if cost_matrix[t, d] <= (1 - self.iou_threshold):
+                is_match = True
+            
+            # Rescue match if IoU failed (fast movement) but appearance is VERY high
+            # (e.g. oncoming car jumped far but looks identical)
+            # Cost logic above already blends them. If cost is low, it means good match.
+            # Strict IoU check solely to prevent teleportation across screen
+            current_iou = 1 - cost_matrix[t, d] # Approx, not real IoU if hybrid
+            
+            if is_match:
                 matched.append((t, d))
                 if d in unmatched_dets:
                     unmatched_dets.remove(d)

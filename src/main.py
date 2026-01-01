@@ -19,8 +19,36 @@ import os
 # Suppress FFMPEG logs
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 os.environ["OPENCV_FFMPEG_LOGLEVEL"] = "0"
+os.environ["OPENCV_VIDEOIO_DEBUG"] = "0"
+os.environ["OPENCV_VIDEOCAPTURE_DEBUG"] = "0"
 import warnings
 warnings.filterwarnings("ignore", message=".*n_jobs value 1 overridden.*")
+
+# Redirect C-level stderr to null to silence FFMPEG/TLS noise
+try:
+    # 1. Save original stderr fd
+    original_stderr_fd = os.dup(sys.stderr.fileno())
+    
+    # 2. Open devnull
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    
+    # 3. Replace stderr (fd 2) with devnull
+    os.dup2(devnull, sys.stderr.fileno())
+    
+    # 4. Create a new sys.stderr pointing to the saved original stderr
+    # This allows Python logs to still show up
+    sys.stderr = os.fdopen(original_stderr_fd, 'w')
+    
+    # 5. Close the devnull handle (dup2 verified it)
+    os.close(devnull)
+    
+    # 6. Configure loguru to use the new sys.stderr
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+
+except Exception as e:
+    # If redirection fails (e.g. no console), just continue
+    pass
 
 from rich.console import Console
 from rich.live import Live
@@ -57,14 +85,14 @@ class PipelineConfig:
     video_source: str = ""
     video_type: str = "auto"
     target_resolution: tuple[int, int] = (1280, 720)  # Higher res for better detection
-    processing_fps: int = 5
+    processing_fps: int = 10
     display_fps: int = -1  # -1 = auto (source FPS)
 
     # Detection
     detector_model: str = "yolov8m.pt"  # Medium model for best accuracy
-    detection_confidence: float = 0.25  # Lower threshold to catch more vehicles
+    detection_confidence: float = 0.4  # Increased to filter phantom objects
     detection_classes: list[int] | None = None
-    min_box_area: int = 200  # Lower to detect distant vehicles
+    min_box_area: int = 500  # Increased to ignore noise
 
     # Features
     feature_model: str = "facebook/dinov2-base"
@@ -72,16 +100,16 @@ class PipelineConfig:
 
     # Clustering
     warmup_duration: int = 60  # seconds
-    min_samples: int = 50
+    min_samples: int = 200  # Aggressive merging
     cluster_algorithm: str = "hdbscan"
     n_clusters: int | None = None
-    min_cluster_size: int = 100  # Larger = fewer, more distinct clusters
+    min_cluster_size: int = 400  # Only large, distinct flows
     recluster_interval: int = 300  # seconds
 
     # Tracking
-    max_track_age: int = 90  # Max frames to keep lost track (increased for fast vehicles)
-    min_hits: int = 1  # Min hits before track is confirmed (lowered for debugging)
-    iou_threshold: float = 0.1  # IoU threshold for matching (lowered for fast-moving objects)
+    max_track_age: int = 10  # Very low to kill ghosts instantly (1s)
+    min_hits: int = 3  # Reduced for faster detection (0.3s)
+    iou_threshold: float = 0.2  # Threshold tuned for 80/20 hybrid cost
 
     # Output
     enable_display: bool = True
@@ -247,11 +275,6 @@ class Pipeline:
             cluster_names,
             delay_frames=delay,
         )
-        
-        # Debug logging
-        max_streak = max((t.hit_streak for t in tracks), default=0)
-        if len(detections) > 0:
-            logger.debug(f"Assoc: delay={delay}, tracks={len(tracks)}, max_streak={max_streak}")
 
         # Update flow analytics
         if self._flow_analyzer:

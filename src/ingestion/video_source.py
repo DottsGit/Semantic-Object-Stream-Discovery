@@ -169,7 +169,11 @@ class OpenCVSource(VideoSource):
     def fps(self) -> float:
         """Get source FPS."""
         if self._cap:
-            return self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+            # Set buffer size (frames)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1024)
+
+            video_fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+            return video_fps
         return 30.0
 
 
