@@ -9,7 +9,7 @@ An unsupervised vision pipeline that ingests video streams, discovers object typ
 - **Real-time tracking**: SORT-based multi-object tracking with cluster assignment
 - **Flow analytics**: Per-cluster flow rates, velocities, and statistics
 - **GCP integration**: Pub/Sub events, BigQuery analytics, Cloud Run deployment
-- **Live dashboard**: Streamlit-based visualization
+- **Live dashboard**: Streamlit-based visualization (demo mode)
 
 ## How It Works
 
@@ -77,6 +77,7 @@ Options:
   --type          Source type: auto, rtsp, hls, youtube, file, webcam
   --warmup        Warmup duration in seconds (default: 60)
   --clusters      Number of clusters (None = auto-detect)
+  --min-cluster-size Min samples per cluster (default: 100)
   --device        Processing device: cuda, cpu, mps (default: cuda)
   --no-display    Disable visualization window
   --detector      YOLO model: yolov8n.pt, yolov8s.pt, etc.
@@ -85,27 +86,14 @@ Options:
 
 ## Configuration
 
-Configuration is handled via environment variables or `config/settings.py`:
+Configuration is primarily handled via CLI arguments.
+Default settings are defined in `src/main.py`.
 
-```bash
-# Video settings
-export SOSD_VIDEO__FPS_LIMIT=10
-export SOSD_VIDEO__RESOLUTION="(640,480)"
-
-# Clustering settings
-export SOSD_CLUSTERING__WARMUP_DURATION=60
-export SOSD_CLUSTERING__ALGORITHM=hdbscan
-export SOSD_CLUSTERING__MIN_CLUSTER_SIZE=10
-
-# GCP settings
-export SOSD_OUTPUT__ENABLE_PUBSUB=true
-export SOSD_OUTPUT__PUBSUB_PROJECT=your-project-id
-export SOSD_OUTPUT__ENABLE_BIGQUERY=true
-```
+The `config/settings.py` file contains schema definitions for future configuration expansion using environment variables, but currently `main.py` relies on command-line arguments.
 
 ## Dashboard
 
-Run the Streamlit dashboard:
+Run the Streamlit dashboard (Demo Mode):
 
 ```bash
 streamlit run src/output/dashboard.py
@@ -207,4 +195,4 @@ src/
 - Python 3.10+
 - CUDA-capable GPU (recommended) or CPU
 - 4GB+ RAM
-- For YouTube streams: `streamlink` package
+- For YouTube streams: `yt-dlp` package
