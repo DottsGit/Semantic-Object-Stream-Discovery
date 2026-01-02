@@ -634,7 +634,7 @@ def main():
     parser.add_argument("--no-display", action="store_true", help="Disable display window")
     parser.add_argument("--detector", default="yolov8m.pt", help="YOLO model (yolov8n/s/m/l/x.pt)")
     parser.add_argument("--vehicles-only", action="store_true", help="Only detect vehicles")
-    parser.add_argument("--processing-fps", type=int, default=5, help="FPS limit for detection/processing")
+    parser.add_argument("--processing-fps", type=int, default=25, help="FPS limit for detection/processing")
     parser.add_argument("--display-fps", type=int, default=-1, help="Target FPS for display (default=-1 for auto/source FPS)")
 
     args = parser.parse_args()
