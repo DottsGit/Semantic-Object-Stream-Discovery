@@ -69,9 +69,10 @@ class ObjectClusterer:
         algorithm: str = "hdbscan",
         n_clusters: int | None = None,
         min_cluster_size: int = 10,
-        use_umap: bool = True,
-        umap_n_components: int = 32,
+        use_pca: bool = True,
+        pca_n_components: int = 32,
         min_samples: int = 50,
+        cluster_scale: float = 0.025,
     ):
         """Initialize the clusterer.
 
@@ -79,41 +80,33 @@ class ObjectClusterer:
             algorithm: Clustering algorithm (kmeans, hdbscan, dbscan)
             n_clusters: Number of clusters (required for kmeans, ignored for hdbscan)
             min_cluster_size: Minimum cluster size for HDBSCAN
-            use_umap: Whether to use UMAP for dimensionality reduction before clustering
-            umap_n_components: Target dimensions for UMAP
+            use_pca: Whether to use PCA for dimensionality reduction before clustering
+            pca_n_components: Target dimensions for PCA
             min_samples: Minimum samples required before clustering
         """
         self.algorithm = ClusterAlgorithm(algorithm)
         self.n_clusters = n_clusters
         self.min_cluster_size = min_cluster_size
-        self.use_umap = use_umap
-        self.umap_n_components = umap_n_components
+        self.use_pca = use_pca
+        self.pca_n_components = pca_n_components
         self.min_samples = min_samples
+        self.cluster_scale = cluster_scale
 
         self._scaler = StandardScaler()
-        self._umap_model: Any = None
+        self._pca_model: Any = None
         self._cluster_model: Any = None
         self._fitted = False
         self._last_result: ClusterResult | None = None
 
-    def _init_umap(self, n_samples: int) -> Any:
-        """Initialize UMAP model."""
-        try:
-            import umap
-
-            # Adjust n_neighbors based on sample size
-            n_neighbors = min(15, n_samples - 1)
-
-            return umap.UMAP(
-                n_components=self.umap_n_components,
-                n_neighbors=n_neighbors,
-                min_dist=0.1,
-                metric="cosine",
-                random_state=42,
-            )
-        except ImportError:
-            logger.warning("umap-learn not installed, skipping UMAP")
-            return None
+    def _init_pca(self, n_samples: int) -> Any:
+        """Initialize PCA model."""
+        from sklearn.decomposition import PCA
+        
+        # Determine components (cannot exceed min(n_samples, features))
+        # feature dim is usually 768.
+        n_components = min(self.pca_n_components, n_samples)
+        
+        return PCA(n_components=n_components, random_state=42)
 
     def _init_cluster_model(self, n_samples: int) -> Any:
         """Initialize the clustering model."""
@@ -131,13 +124,27 @@ class ObjectClusterer:
             try:
                 import hdbscan
 
-                # Adjust min_cluster_size based on sample size
-                min_cluster = min(self.min_cluster_size, n_samples // 5)
-                min_cluster = max(min_cluster, 5)
+                # Adjust min_cluster_size based on sample size to prevent fragmentation
+                # For small datasets, use provided min (capped at likely max).
+                # For large datasets, scale up (e.g. 1% of data).
+                # This prevents getting 50 tiny clusters when we really want 3-5 big ones.
+                
+                # 1. Base floor from config
+                base_min = self.min_cluster_size
+                
+                # 2. Scale factor (Dynamic)
+                scale_min = int(n_samples * self.cluster_scale)
+                
+                # 3. Take the LARGER of the two (enforcing bigger clusters for bigger data)
+                # But don't exceed a reasonable cap (e.g. 50% of data)
+                final_min_cluster = max(base_min, scale_min)
+                final_min_cluster = min(final_min_cluster, n_samples // 2)
+
+                logger.info(f"Dynamic min_cluster_size: {final_min_cluster} (samples: {n_samples})")
 
                 return hdbscan.HDBSCAN(
-                    min_cluster_size=min_cluster,
-                    min_samples=max(3, min_cluster // 2),
+                    min_cluster_size=final_min_cluster,
+                    min_samples=final_min_cluster,  # Conservative: Require high density to prevent bridging
                     metric="euclidean",
                     cluster_selection_method="eom",
                 )
@@ -182,12 +189,12 @@ class ObjectClusterer:
         # Normalize embeddings
         embeddings_scaled = self._scaler.fit_transform(embeddings)
 
-        # Optional UMAP dimensionality reduction
-        if self.use_umap and embeddings.shape[1] > self.umap_n_components:
-            self._umap_model = self._init_umap(n_samples)
-            if self._umap_model:
-                logger.info(f"Reducing dimensions with UMAP: {embeddings.shape[1]} -> {self.umap_n_components}")
-                embeddings_reduced = self._umap_model.fit_transform(embeddings_scaled)
+        # Optional PCA dimensionality reduction
+        if self.use_pca and embeddings.shape[1] > self.pca_n_components:
+            self._pca_model = self._init_pca(n_samples)
+            if self._pca_model:
+                logger.info(f"Reducing dimensions with PCA: {embeddings.shape[1]} -> {self._pca_model.n_components}")
+                embeddings_reduced = self._pca_model.fit_transform(embeddings_scaled)
             else:
                 embeddings_reduced = embeddings_scaled
         else:
@@ -197,13 +204,12 @@ class ObjectClusterer:
         self._cluster_model = self._init_cluster_model(n_samples)
         labels = self._cluster_model.fit_predict(embeddings_reduced)
 
-        # Create 2D embeddings for visualization
+        # Create 2D embeddings for visualization using PCA (faster than UMAP)
         embeddings_2d = None
         try:
-            import umap
-
-            umap_2d = umap.UMAP(n_components=2, random_state=42)
-            embeddings_2d = umap_2d.fit_transform(embeddings_scaled)
+            from sklearn.decomposition import PCA
+            pca_2d = PCA(n_components=2, random_state=42)
+            embeddings_2d = pca_2d.fit_transform(embeddings_scaled)
         except ImportError:
             pass
 
@@ -261,9 +267,9 @@ class ObjectClusterer:
         # Normalize
         embeddings_scaled = self._scaler.transform(embeddings)
 
-        # UMAP transform if used during fit
-        if self._umap_model is not None:
-            embeddings_reduced = self._umap_model.transform(embeddings_scaled)
+        # PCA transform if used during fit
+        if self._pca_model is not None:
+            embeddings_reduced = self._pca_model.transform(embeddings_scaled)
         else:
             embeddings_reduced = embeddings_scaled
 

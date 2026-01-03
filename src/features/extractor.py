@@ -64,7 +64,7 @@ class DINOv2Extractor:
 
             logger.info(f"Loading DINOv2 model: {self.model_name}")
 
-            self._processor = AutoImageProcessor.from_pretrained(self.model_name)
+            self._processor = AutoImageProcessor.from_pretrained(self.model_name, use_fast=True)
             self._model = AutoModel.from_pretrained(self.model_name)
             self._model.to(self.device)
             self._model.eval()

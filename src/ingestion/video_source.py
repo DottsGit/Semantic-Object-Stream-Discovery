@@ -85,7 +85,7 @@ class OpenCVSource(VideoSource):
         self._frame_count = 0
         self._start_time: float | None = None
         self._last_frame_time = 0.0
-        self._min_frame_interval = 1.0 / fps_limit if fps_limit else 0
+        self._min_frame_interval = 0.0
 
     def open(self) -> bool:
         """Open the video capture."""
@@ -102,8 +102,17 @@ class OpenCVSource(VideoSource):
             logger.error(f"Failed to open video source: {self.source}")
             return False
 
-        self._start_time = time.time()
-        logger.info(f"Opened video source: {self.source} @ {self.fps:.1f} FPS")
+        # Calculate frame interval
+        if self.fps_limit and self.fps_limit > 0:
+            self._min_frame_interval = 1.0 / self.fps_limit
+        else:
+            # Use native FPS
+            native_fps = self.fps
+            if native_fps > 0:
+                self._min_frame_interval = 1.0 / native_fps
+
+        self._start_time = time.perf_counter()
+        logger.info(f"Opened video source: {self.source} @ {self.fps:.1f} FPS (Interval: {self._min_frame_interval:.3f}s)")
         return True
 
     def read(self) -> Frame | None:
@@ -112,18 +121,26 @@ class OpenCVSource(VideoSource):
             return None
 
         # Rate limiting for livestreams
-        if self.fps_limit:
-            current_time = time.time()
-            elapsed = current_time - self._last_frame_time
-            if elapsed < self._min_frame_interval:
-                # Skip frames to maintain target FPS
-                time.sleep(self._min_frame_interval - elapsed)
+        # Rate limiting for livestreams
+        if self._min_frame_interval > 0:
+            target_time = self._last_frame_time + self._min_frame_interval
+            current_time = time.perf_counter()
+            remaining = target_time - current_time
+            
+            if remaining > 0:
+                # Sleep for most of the time
+                if remaining > 0.002:
+                    time.sleep(remaining - 0.002)
+                
+                # Busy wait for the last bit for precision
+                while time.perf_counter() < target_time:
+                    pass
 
         ret, frame = self._cap.read()
         if not ret:
             return None
 
-        self._last_frame_time = time.time()
+        self._last_frame_time = time.perf_counter()
         self._frame_count += 1
 
         # Resize if needed
@@ -152,7 +169,11 @@ class OpenCVSource(VideoSource):
     def fps(self) -> float:
         """Get source FPS."""
         if self._cap:
-            return self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+            # Set buffer size (frames)
+            self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1024)
+
+            video_fps = self._cap.get(cv2.CAP_PROP_FPS) or 30.0
+            return video_fps
         return 30.0
 
 
