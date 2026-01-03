@@ -91,8 +91,11 @@ class PipelineConfig:
     video_source: str = ""
     video_type: str = "auto"
     target_resolution: tuple[int, int] = (1280, 720)  # Higher res for better detection
-    processing_fps: int = 10
-    display_fps: int = -1  # -1 = auto (source FPS)
+    processing_fps: int = -1
+    display_fps: int = -1
+    pca_n_components: int = 32
+    min_cluster_scale: float = 0.025
+    auto_tune: bool = False  # -1 = auto (source FPS)
 
     # Detection
     detector_model: str = "yolov8m.pt"  # Medium model for best accuracy
@@ -142,8 +145,15 @@ def run_clustering_job(config: dict, embeddings: np.ndarray) -> Any:
         ClusterResult object (lightweight dataclass)
     """
     import os
+    import sys
     import psutil
+    from loguru import logger
     from src.clustering.clusterer import ObjectClusterer
+    
+    # Configure logger for worker process (force stderr output)
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+    logger.add(sys.stdout, level="INFO")
     
     # CRITICAL: Lower process priority to ensure Video/UI thread is never starved
     try:
@@ -173,6 +183,40 @@ def run_clustering_job(config: dict, embeddings: np.ndarray) -> Any:
         # relying on centroid prediction (which is robust).
     }
 
+
+def run_autotune_job(embeddings: np.ndarray) -> dict:
+    """Run auto-tuning in background process.
+    
+    Args:
+        embeddings: Feature embeddings
+        
+    Returns:
+        Dictionary with 'best_result' (TuningResult)
+    """
+    import os
+    import sys
+    import psutil
+    from loguru import logger
+    from src.clustering.autotune import AutoTuner
+    
+    # Configure logger
+    logger.remove()
+    logger.add(sys.stderr, level="INFO")
+    logger.add(sys.stdout, level="INFO")
+    
+    try:
+        p = psutil.Process(os.getpid())
+        p.nice(psutil.IDLE_PRIORITY_CLASS)
+    except Exception as e:
+        logger.warning(f"Failed to lower process priority: {e}")
+        
+    os.environ["OMP_NUM_THREADS"] = "1"
+    
+    tuner = AutoTuner()
+    result = tuner.tune(embeddings)
+    
+    return {"best_result": result}
+    
 
 def warmup_worker() -> bool:
     """Pre-load heavy libraries only (imports only)."""
@@ -235,6 +279,7 @@ class Pipeline:
         self._start_time: float = 0
         self._warmup_start: float = 0
         self._last_cluster_time: float = 0
+        self._tuned: bool = False
         self._frame_count: int = 0
         self._frame_count: int = 0
         self._last_log_time: float = 0
@@ -284,7 +329,8 @@ class Pipeline:
             min_cluster_size=self.config.min_cluster_size,
             min_samples=self.config.min_samples,
             use_pca=True,
-            pca_n_components=32
+            pca_n_components=self.config.pca_n_components,
+            cluster_scale=self.config.min_cluster_scale
         )
 
         # Tracker
@@ -469,24 +515,36 @@ class Pipeline:
             indices = np.random.choice(len(embeddings), MAX_SAMPLES, replace=False)
             embeddings = embeddings[indices]
             logger.info("Downsampling complete.")
+        if self.config.auto_tune and not self._tuned:
+            logger.info("Auto-tuning enabled: Starting grid search...")
+            logger.info(f"Submitting {len(embeddings)} samples to autotune process...")
+            self._clustering_future = self._process_executor.submit(
+                run_autotune_job, 
+                embeddings
+            )
+        else:
+            # Standard Clustering
             
-        # This avoids pickling the heavy ObjectClusterer instance
-        config = {
-            "algorithm": self._clusterer.algorithm.value,
-            "n_clusters": self._clusterer.n_clusters,
-            "min_cluster_size": self._clusterer.min_cluster_size,
-            "use_pca": self._clusterer.use_pca,
-            "pca_n_components": self._clusterer.pca_n_components,
-            "min_samples": self._clusterer.min_samples,
-        }
+            # This avoids pickling the heavy ObjectClusterer instance
+            config = {
+                "algorithm": self._clusterer.algorithm.value,
+                "n_clusters": self._clusterer.n_clusters,
+                "min_cluster_size": self._clusterer.min_cluster_size,
+                "use_pca": self._clusterer.use_pca,
+                "pca_n_components": self.config.pca_n_components,
+                "min_samples": self._clusterer.min_samples,
+                "cluster_scale": self._clusterer.cluster_scale,
+            }
 
-        # We submit config AND embeddings to the process
-        logger.info(f"Submitting {len(embeddings)} samples to background process...")
-        self._clustering_future = self._process_executor.submit(
-            run_clustering_job, 
-            config, 
-            embeddings
-        )
+            # We submit config AND embeddings to the process
+            logger.info(f"Submitting {len(embeddings)} samples to background process...")
+            self._clustering_future = self._process_executor.submit(
+                run_clustering_job, 
+                config, 
+                embeddings
+            )
+        
+        self._last_cluster_time = time.time()
 
 
     def _display_frame(self, result: dict) -> None:
@@ -585,6 +643,52 @@ class Pipeline:
         if cv2.waitKey(1) & 0xFF == ord("q"):
             self._stop_event.set()
 
+    def _reassign_track_clusters(self) -> None:
+        """Update cluster assignments for all active tracks using the new model.
+        
+        This is critical when re-clustering happens: old cluster IDs become invalid,
+        so we must re-predict based on the track's embedded features.
+        """
+        if not self._clusterer._fitted:
+            return
+
+        if not self._clusterer._fitted:
+            return
+
+        # Use .tracks or .confirmed_tracks (Tracker doesn't have active_tracks property)
+        # Using .tracks to cover everything including young candidates
+        active_tracks = self._tracker.tracks
+        if not active_tracks:
+            return
+            
+        logger.info(f"Re-assigning clusters for {len(active_tracks)} tracks...")
+        
+        # Collect embeddings from tracks
+        embeddings = []
+        valid_tracks = []
+        for track in active_tracks:
+            # Prefer using the track's 'latest' embedding or an average
+            # Assuming track holds a list of recent features or a representative one
+            if track.features:
+                # Use the most recent feature
+                embeddings.append(track.features[-1].embedding)
+                valid_tracks.append(track)
+                
+        if not embeddings:
+            return
+            
+        # Bulk predict
+        embeddings_arr = np.vstack(embeddings)
+        labels = self._clusterer.predict(embeddings_arr)
+        
+        # Update tracks
+        for track, label in zip(valid_tracks, labels):
+            track.cluster_id = int(label)
+            # Reset stable logic or force update
+            track.cluster_history.append(int(label))
+            
+        logger.info("Track re-assignment complete.")
+
     def _log_stats(self) -> None:
         """Log current statistics."""
         if self._flow_analyzer:
@@ -670,25 +774,52 @@ class Pipeline:
                     try:
                         # Value returned is now a dict with state
                         ret = self._clustering_future.result()
-                        cluster_result = ret["result"]
                         
-                        logger.info("Background clustering process complete!")
-                        
-                        # Apply result AND MODELS to our local clusterer
-                        # This enables predict() to work correctly
-                        self._clusterer._last_result = cluster_result
-                        self._clusterer._scaler = ret["scaler"]
-                        self._clusterer._pca_model = ret["pca_model"]
-                        # We don't sync hdbscan object to avoid issues, we use centroid prediction
-                        
-                        self._clusterer._fitted = True
-                        
-                        # Print generic info
-                        if cluster_result:
-                             logger.info(f"Clustering finished: {cluster_result.n_clusters} clusters found.")
+                        if "best_result" in ret:
+                            # This was an Auto-Tune job
+                            tuning_res = ret["best_result"]
+                            logger.info(f"Auto-Tune Winner: PCA={tuning_res.pca_dims}, Scale={tuning_res.cluster_scale:.3f}")
+                            logger.info(f"Score={tuning_res.score:.1f}, Clusters={tuning_res.n_clusters}, Noise={tuning_res.noise_ratio:.2f}")
+                            
+                            # Update config
+                            self.config.pca_n_components = tuning_res.pca_dims
+                            self.config.min_cluster_scale = tuning_res.cluster_scale
+                            
+                            # Update Clusterer locally
+                            self._clusterer.pca_n_components = tuning_res.pca_dims
+                            self._clusterer.cluster_scale = tuning_res.cluster_scale
+                            
+                            self._tuned = True
+                            
+                            # Create an empty result/state for now, wait for next normal clustered frame
+                            # Or immediately trigger real clustering with new params
+                            logger.info("Applying tuned parameters and re-clustering immediately...")
+                            self._perform_clustering_task()
+                            
+                        else:
+                            # Standard Clustering Result
+                            cluster_result = ret["result"]
+                            
+                            logger.info("Background clustering process complete!")
+                            
+                            # Apply result AND MODELS to our local clusterer
+                            # This enables predict() to work correctly
+                            self._clusterer._last_result = cluster_result
+                            self._clusterer._scaler = ret["scaler"]
+                            self._clusterer._pca_model = ret["pca_model"]
+                            # We don't sync hdbscan object to avoid issues, we use centroid prediction
+                            
+                            self._clusterer._fitted = True
+                            
+                            # Print generic info
+                            if cluster_result:
+                                 logger.info(f"Clustering finished: {cluster_result.n_clusters} clusters found.")
+                                 
+                            # CRITICAL: Re-assign existing tracks to new clusters
+                            self._reassign_track_clusters()
                         
                     except Exception as e:
-                        logger.error(f"Clustering process failed: {e}")
+                        logger.error(f"Clustering/Tuning process failed: {e}")
                     self._clustering_future = None
 
                 # 3. Submit new task if idle and interval elapsed
@@ -788,6 +919,9 @@ def main():
     parser.add_argument("--vehicles-only", action="store_true", help="Only detect vehicles")
     parser.add_argument("--processing-fps", type=int, default=-1, help="FPS limit for detection/processing")
     parser.add_argument("--display-fps", type=int, default=-1, help="Target FPS for display (default=-1 for auto/source FPS)")
+    parser.add_argument("--pca-dims", type=int, default=32, help="Target dimensions for PCA reduction (default=32)")
+    parser.add_argument("--min-cluster-scale", type=float, default=0.025, help="Scale factor for min cluster size (fraction of samples, default=0.025)")
+    parser.add_argument("--auto-tune", action="store_true", help="Automatically tune clustering parameters during warmup")
 
     args = parser.parse_args()
 
@@ -804,6 +938,9 @@ def main():
         detection_classes=[2, 3, 5, 7] if args.vehicles_only else None,  # COCO vehicle classes
         processing_fps=args.processing_fps,
         display_fps=args.display_fps,
+        pca_n_components=args.pca_dims,
+        min_cluster_scale=args.min_cluster_scale,
+        auto_tune=args.auto_tune,
     )
 
     # Setup signal handlers

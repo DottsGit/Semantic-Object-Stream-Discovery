@@ -72,6 +72,7 @@ class ObjectClusterer:
         use_pca: bool = True,
         pca_n_components: int = 32,
         min_samples: int = 50,
+        cluster_scale: float = 0.025,
     ):
         """Initialize the clusterer.
 
@@ -89,6 +90,7 @@ class ObjectClusterer:
         self.use_pca = use_pca
         self.pca_n_components = pca_n_components
         self.min_samples = min_samples
+        self.cluster_scale = cluster_scale
 
         self._scaler = StandardScaler()
         self._pca_model: Any = None
@@ -130,8 +132,8 @@ class ObjectClusterer:
                 # 1. Base floor from config
                 base_min = self.min_cluster_size
                 
-                # 2. Scale factor (1.5% of samples)
-                scale_min = int(n_samples * 0.015)
+                # 2. Scale factor (Dynamic)
+                scale_min = int(n_samples * self.cluster_scale)
                 
                 # 3. Take the LARGER of the two (enforcing bigger clusters for bigger data)
                 # But don't exceed a reasonable cap (e.g. 50% of data)
@@ -142,7 +144,7 @@ class ObjectClusterer:
 
                 return hdbscan.HDBSCAN(
                     min_cluster_size=final_min_cluster,
-                    min_samples=max(3, final_min_cluster // 2),  # increased robustness
+                    min_samples=final_min_cluster,  # Conservative: Require high density to prevent bridging
                     metric="euclidean",
                     cluster_selection_method="eom",
                 )
