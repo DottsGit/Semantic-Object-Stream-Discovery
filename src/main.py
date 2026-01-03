@@ -114,6 +114,7 @@ class PipelineConfig:
     n_clusters: int | None = None
     min_cluster_size: int = 400  # Only large, distinct flows
     recluster_interval: int = 300  # seconds
+    max_buffer_size: int = 10000  # Max samples to store for clustering
 
     # Tracking
     max_track_age: int = 10  # Very low to kill ghosts instantly (1s)
@@ -319,7 +320,7 @@ class Pipeline:
         self._feature_extractor.load()
 
         # Feature buffer for warmup
-        self._feature_buffer = FeatureBuffer(max_size=10000)
+        self._feature_buffer = FeatureBuffer(max_size=self.config.max_buffer_size)
 
         # Clusterer
         # Clusterer
@@ -645,13 +646,10 @@ class Pipeline:
 
     def _reassign_track_clusters(self) -> None:
         """Update cluster assignments for all active tracks using the new model.
-        
+
         This is critical when re-clustering happens: old cluster IDs become invalid,
         so we must re-predict based on the track's embedded features.
         """
-        if not self._clusterer._fitted:
-            return
-
         if not self._clusterer._fitted:
             return
 
@@ -660,34 +658,34 @@ class Pipeline:
         active_tracks = self._tracker.tracks
         if not active_tracks:
             return
-            
+
         logger.info(f"Re-assigning clusters for {len(active_tracks)} tracks...")
-        
+
         # Collect embeddings from tracks
         embeddings = []
         valid_tracks = []
         for track in active_tracks:
-            # Prefer using the track's 'latest' embedding or an average
-            # Assuming track holds a list of recent features or a representative one
-            if track.features:
-                # Use the most recent feature
-                embeddings.append(track.features[-1].embedding)
+            # Track stores embeddings as list[np.ndarray], use mean_embedding property
+            if track.embeddings:
+                # Use the mean embedding for stable cluster assignment
+                embeddings.append(track.mean_embedding)
                 valid_tracks.append(track)
-                
+
         if not embeddings:
+            logger.info("No tracks with embeddings to reassign")
             return
-            
+
         # Bulk predict
         embeddings_arr = np.vstack(embeddings)
         labels = self._clusterer.predict(embeddings_arr)
-        
+
         # Update tracks
         for track, label in zip(valid_tracks, labels):
             track.cluster_id = int(label)
-            # Reset stable logic or force update
-            track.cluster_history.append(int(label))
-            
-        logger.info("Track re-assignment complete.")
+            # Update cluster history (Counter uses += or direct key increment)
+            track.cluster_history[int(label)] += 1
+
+        logger.info(f"Track re-assignment complete: {len(valid_tracks)} tracks updated")
 
     def _log_stats(self) -> None:
         """Log current statistics."""
@@ -780,21 +778,31 @@ class Pipeline:
                             tuning_res = ret["best_result"]
                             logger.info(f"Auto-Tune Winner: PCA={tuning_res.pca_dims}, Scale={tuning_res.cluster_scale:.3f}")
                             logger.info(f"Score={tuning_res.score:.1f}, Clusters={tuning_res.n_clusters}, Noise={tuning_res.noise_ratio:.2f}")
-                            
-                            # Update config
+
+                            # Update config for future re-clustering
                             self.config.pca_n_components = tuning_res.pca_dims
                             self.config.min_cluster_scale = tuning_res.cluster_scale
-                            
+
                             # Update Clusterer locally
                             self._clusterer.pca_n_components = tuning_res.pca_dims
                             self._clusterer.cluster_scale = tuning_res.cluster_scale
-                            
+
                             self._tuned = True
-                            
-                            # Create an empty result/state for now, wait for next normal clustered frame
-                            # Or immediately trigger real clustering with new params
-                            logger.info("Applying tuned parameters and re-clustering immediately...")
-                            self._perform_clustering_task()
+
+                            # USE THE WINNING RESULT DIRECTLY instead of re-clustering
+                            # This avoids the issue where a new random sample gives different results
+                            if tuning_res.cluster_result and tuning_res.n_clusters > 0:
+                                logger.info(f"Using winning result directly: {tuning_res.n_clusters} clusters")
+                                self._clusterer._last_result = tuning_res.cluster_result
+                                self._clusterer._scaler = tuning_res.scaler
+                                self._clusterer._pca_model = tuning_res.pca_model
+                                self._clusterer._fitted = True
+
+                                # Re-assign existing tracks to new clusters
+                                self._reassign_track_clusters()
+                            else:
+                                logger.warning("Auto-tune found no valid clusters, triggering re-clustering...")
+                                self._perform_clustering_task()
                             
                         else:
                             # Standard Clustering Result
@@ -922,6 +930,7 @@ def main():
     parser.add_argument("--pca-dims", type=int, default=32, help="Target dimensions for PCA reduction (default=32)")
     parser.add_argument("--min-cluster-scale", type=float, default=0.025, help="Scale factor for min cluster size (fraction of samples, default=0.025)")
     parser.add_argument("--auto-tune", action="store_true", help="Automatically tune clustering parameters during warmup")
+    parser.add_argument("--max-samples", type=int, default=10000, help="Max samples to collect during warmup (default=10000)")
 
     args = parser.parse_args()
 
@@ -941,6 +950,7 @@ def main():
         pca_n_components=args.pca_dims,
         min_cluster_scale=args.min_cluster_scale,
         auto_tune=args.auto_tune,
+        max_buffer_size=args.max_samples,
     )
 
     # Setup signal handlers
