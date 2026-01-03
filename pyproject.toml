@@ -14,7 +14,8 @@ dependencies = [
     # Deep learning
     "torch>=2.0.0",
     "torchvision>=0.15.0",
-    "transformers>=4.35.0",  # For DINOv2
+    "transformers>=4.35.0",  # For DINOv3
+    "timm>=0.9.0", # For DINOv3 (float32 safe)
     "ultralytics>=8.0.0",  # YOLOv8 for base detection
 
     # Clustering & ML

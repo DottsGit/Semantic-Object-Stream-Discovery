@@ -1,4 +1,4 @@
-"""DINOv2 feature extraction module for unsupervised object representation."""
+"""DINOv3 feature extraction module for unsupervised object representation."""
 
 from __future__ import annotations
 
@@ -9,7 +9,14 @@ import numpy as np
 import torch
 from loguru import logger
 
+
 from src.detection.detector import Detection
+
+
+# Define stats for normalization (DINOv3 / ImageNet stats)
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
 
 
 @dataclass
@@ -17,7 +24,7 @@ class ObjectFeature:
     """Feature vector for a detected object."""
 
     detection: Detection
-    embedding: np.ndarray  # DINOv2 embedding vector
+    embedding: np.ndarray  # DINOv3 embedding vector
     crop_image: np.ndarray | None = None  # Optional: store the cropped image
 
     @property
@@ -26,27 +33,30 @@ class ObjectFeature:
         return self.embedding
 
 
-class DINOv2Extractor:
-    """Feature extractor using DINOv2 vision transformer."""
+class DINOv3Extractor:
+    """Feature extractor using DINOv3 vision transformer.
+
+    Uses timm (Ross Wightman's library) for the DINOv3 model.
+    """
 
     def __init__(
         self,
-        model_name: str = "facebook/dinov2-base",
+        model_name: str = "timm/vit_base_patch16_dinov3.lvd1689m",
         device: str = "cuda",
         batch_size: int = 16,
         image_size: int = 224,
     ):
-        """Initialize DINOv2 feature extractor.
+        """Initialize DINOv3 feature extractor.
 
         Args:
-            model_name: HuggingFace model name for DINOv2
-                - facebook/dinov2-small (384-dim)
-                - facebook/dinov2-base (768-dim)
-                - facebook/dinov2-large (1024-dim)
-                - facebook/dinov2-giant (1536-dim)
+            model_name: HuggingFace/timm model name for DINOv3
+                - timm/vit_small_patch16_dinov3.lvd1689m
+                - timm/vit_base_patch16_dinov3.lvd1689m
+                - timm/vit_large_patch16_dinov3.lvd1689m
+                - timm/vit_giant_patch14_dinov3.lvd1689m
             device: Device to run on (cuda, cpu, mps)
             batch_size: Batch size for feature extraction
-            image_size: Input image size (DINOv2 uses 224 or 518)
+            image_size: Input image size (DINOv3 usually 224 or 518)
         """
         self.model_name = model_name
         self.device = device if torch.cuda.is_available() else "cpu"
@@ -54,29 +64,32 @@ class DINOv2Extractor:
         self.image_size = image_size
 
         self._model = None
-        self._processor = None
         self._embedding_dim: int | None = None
 
     def load(self) -> None:
-        """Load the DINOv2 model and processor."""
+        """Load the DINOv3 model."""
         try:
-            from transformers import AutoImageProcessor, AutoModel
+            import timm
+            
+            logger.info(f"Loading DINOv3 model (timm): {self.model_name}")
 
-            logger.info(f"Loading DINOv2 model: {self.model_name}")
-
-            self._processor = AutoImageProcessor.from_pretrained(self.model_name, use_fast=True)
-            self._model = AutoModel.from_pretrained(self.model_name)
+            # Create model with num_classes=0 to get pooling/embedding support
+            self._model = timm.create_model(
+                self.model_name, 
+                pretrained=True, 
+                num_classes=0, 
+            )
             self._model.to(self.device)
             self._model.eval()
 
-            # Get embedding dimension from config
-            self._embedding_dim = self._model.config.hidden_size
+            # Get embedding dimension
+            self._embedding_dim = self._model.num_features
             logger.info(
-                f"Loaded DINOv2 with {self._embedding_dim}-dim embeddings on {self.device}"
+                f"Loaded DINOv3 with {self._embedding_dim}-dim embeddings on {self.device}"
             )
 
         except ImportError:
-            logger.error("transformers not installed. Run: pip install transformers")
+            logger.error("timm not installed. Run: pip install timm")
             raise
 
     @property
@@ -87,7 +100,7 @@ class DINOv2Extractor:
         return self._embedding_dim or 768
 
     def _preprocess_crop(self, crop: np.ndarray) -> np.ndarray:
-        """Preprocess a crop for DINOv2.
+        """Preprocess a crop for DINOv3.
 
         Args:
             crop: BGR image crop from OpenCV
@@ -99,9 +112,20 @@ class DINOv2Extractor:
         rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
 
         # Resize to model input size
-        resized = cv2.resize(rgb, (self.image_size, self.image_size))
+        # DINOv3/timm usually expects bicubic interpolation for best results
+        resized = cv2.resize(rgb, (self.image_size, self.image_size), interpolation=cv2.INTER_CUBIC)
+        
+        # Normalize (H, W, C) -> (C, H, W)
+        img = resized.astype(np.float32) / 255.0
+        
+        # Standardize using ImageNet stats
+        # (x - mean) / std
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD
+        
+        # Transpose to (C, H, W)
+        img = img.transpose(2, 0, 1)
 
-        return resized
+        return img.astype(np.float32)
 
     def extract(
         self,
@@ -109,7 +133,7 @@ class DINOv2Extractor:
         detections: list[Detection],
         store_crops: bool = False,
     ) -> list[ObjectFeature]:
-        """Extract DINOv2 features for detected objects.
+        """Extract DINOv3 features for detected objects.
 
         Args:
             image: Full frame image (BGR)
@@ -148,16 +172,22 @@ class DINOv2Extractor:
 
         for i in range(0, len(crops), self.batch_size):
             batch_crops = crops[i : i + self.batch_size]
-
-            # Use HuggingFace processor
-            inputs = self._processor(images=batch_crops, return_tensors="pt")
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Stack into tensor
+            batch_tensor = np.stack(batch_crops)
+            batch_tensor = torch.from_numpy(batch_tensor).to(self.device)
+            
+            if self.device == "cuda":
+                # Use float16/bfloat16 for inference speed if available
+                # But careful with DINOv3 RoPE issues - though timm handles this safely now
+                # We'll stick to model's dtype or default float32 for safety
+                pass
 
             with torch.no_grad():
-                outputs = self._model(**inputs)
+                # For num_classes=0, timm returns the pooled output directly
+                outputs = self._model(batch_tensor)
 
-            # Use CLS token embedding (first token)
-            embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+            embeddings = outputs.cpu().numpy()
             all_embeddings.append(embeddings)
 
         # Concatenate all batches
@@ -245,3 +275,7 @@ class FeatureBuffer:
         self._features = []
         self._embeddings = None
         self._dirty = True
+
+
+# Backward-compatible alias
+DINOv2Extractor = DINOv3Extractor

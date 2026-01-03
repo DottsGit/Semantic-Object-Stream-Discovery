@@ -104,7 +104,7 @@ class PipelineConfig:
     min_box_area: int = 500  # Increased to ignore noise
 
     # Features
-    feature_model: str = "facebook/dinov2-base"
+    feature_model: str = "timm/vit_base_patch16_dinov3.lvd1689m"
     device: str = "cuda"
 
     # Clustering
